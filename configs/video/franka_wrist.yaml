@@ -1,0 +1,62 @@
+inherit_from: configs/mono/tum/base_config.yaml
+
+Results:
+  save_results: True
+  save_dir: "results"
+  save_trj: True
+  use_gui: True
+  eval_rendering: True
+  use_wandb: False
+
+Dataset:
+  type: "video"
+  sensor_type: "monocular"
+  dataset_path: "data/franka_fer_realsense_scan"
+  episode_chunk: 0
+  episode_index: 0
+  video_key: "observation.images.wrist"
+  depth_key: "observation.images.wrist_depth"
+  max_frames: 10
+  pcd_downsample: 32
+  pcd_downsample_init: 32
+  adaptive_pointsize: True
+  point_size: 0.01
+  Calibration:
+    fx: 600.0
+    fy: 600.0
+    cx: 320.0
+    cy: 240.0
+    width: 640
+    height: 480
+    distorted: False
+    k1: 0.0
+    k2: 0.0
+    p1: 0.0
+    p2: 0.0
+    k3: 0.0
+    depth_scale: 1000.0
+
+Training:
+  init_itr_num: 20
+  tracking_itr_num: 10
+  mapping_itr_num: 10
+  kf_interval: 5
+  window_size: 8
+  spherical_harmonics: False
+
+Quality:
+  enabled: True
+  output_path: "data/franka_fer_realsense_scan/metrics/episode_000000_wrist_quality.parquet"
+  bbox_min: [-1.0, -1.0, -1.0]
+  bbox_max: [1.0, 1.0, 1.0]
+  coverage_grid_size: 32
+  gaussian_opacity_th: 0.2
+  opacity_th: 0.2
+  scale_ref: 0.03
+  aniso_ref: 4.0
+  obs_ref: 5.0
+  unc_w_scale: 0.4
+  unc_w_aniso: 0.3
+  unc_w_obs: 0.3
+  q_min: [0.0, 0.0, 0.0]
+  q_max: [1.0, 1.0, 0.3]

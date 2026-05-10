@@ -1,0 +1,33 @@
+inherit_from: configs/video/franka_wrist.yaml
+
+Results:
+  save_results: True
+  save_dir: "results"
+  save_trj: True
+  use_gui: False
+  eval_rendering: True
+  eval_real_scan_metrics: True
+  use_wandb: False
+
+Dataset:
+  max_frames: 400
+  pcd_downsample: 128
+  pcd_downsample_init: 128
+  adaptive_pointsize: True
+  point_size: 0.01
+
+Training:
+  init_itr_num: 5
+  tracking_itr_num: 3
+  mapping_itr_num: 3
+  kf_interval: 10
+  window_size: 4
+  spherical_harmonics: False
+
+Quality:
+  enabled: True
+  output_path: "data/franka_fer_realsense_scan/metrics/episode_000000_wrist_quality_gui_light.parquet"
+
+EvalMetrics:
+  validation_interval: 5
+  ee_pose_csv: null
