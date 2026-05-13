@@ -56,6 +56,17 @@ Setup the environment.
 conda env create -f environment.yml
 conda activate MonoGS
 ```
+
+For RTX 50-series GPUs, use the newer environment:
+
+```
+conda env create -f environment_rtx50.yml
+conda activate MonoGS-rtx50
+python -m pip install -r requirements_rtx50_torch.txt
+python -m pip install -r requirements_rtx50_runtime.txt
+source scripts/setup_rtx50_env.sh
+python -m pip install -r requirements_rtx50_extensions.txt
+```
 Depending on your setup, please change the dependency version of pytorch/cudatoolkit in `environment.yml` by following [this document](https://pytorch.org/get-started/previous-versions/).
 
 Our test setup were:
@@ -125,6 +136,17 @@ python slam.py --config configs/live/realsense.yaml
 ```
 We tested the method with [Intel Realsense d455](https://www.mouser.co.uk/new/intel/intel-realsense-depth-camera-d455/). We recommend using a similar global shutter camera for robust camera tracking. Please avoid aggressive camera motion, especially before the initial BA is performed. Check out [the first 15 seconds of our YouTube video](https://youtu.be/x604ghp9R_Q?si=S21HgeVTVfNe0BVL) to see how you should move the camera for initialisation. We recommend to use the code in `dev.speed-up` branch for live demo.
 
+For live RGB-D runs, the repository can also record a replayable offline dataset. When `Recording.enabled=True` in the live config, each run writes:
+- a dataset under `Recording.dataset_root/Recording.dataset_name` with `rgb/`, `depth/`, `rgb.txt`, `depth.txt`, and `pose.txt`
+- `offline_eval_config.yml` in the run result directory for offline rendering evaluation
+
+After the live run finishes, you can re-evaluate PSNR/SSIM offline with:
+```bash
+python scripts/eval_real_scan_metrics.py \
+  --result-dir results/<your_run_dir> \
+  --config results/<your_run_dir>/offline_eval_config.yml
+```
+
 <p align="center">
   <a href="">
     <img src="./media/realsense.png" alt="teaser" width="50%">
@@ -168,13 +190,6 @@ If you found this code/work to be useful in your own research, please considerin
 }
 
 ```
-
-
-
-
-
-
-
 
 
 
