@@ -15,7 +15,7 @@ import torch.nn.functional as F
 from OpenGL import GL as gl
 
 from gaussian_splatting.gaussian_renderer import render
-from gaussian_splatting.utils.graphics_utils import fov2focal, getWorld2View2
+from gaussian_splatting.utils.graphics_utils import fov2focal
 from gui.gl_render import util, util_gau
 from gui.gl_render.render_ogl import OpenGLRenderer
 from gui.gui_utils import (
@@ -51,6 +51,8 @@ class SLAM_GUI:
         self.kf_window = None
         self.render_img = None
         self.quality_metrics = None
+        self.render_fps = 20.0
+        self.ts_prev = 0.0
 
         if params_gui is not None:
             self.background = params_gui.background
@@ -251,11 +253,7 @@ class SLAM_GUI:
         self.g_renderer.set_render_reso(self.g_camera.w, self.g_camera.h)
 
     def add_camera(self, camera, name, color=[0, 1, 0], gt=False, size=0.01):
-        W2C = (
-            getWorld2View2(camera.R_gt, camera.T_gt)
-            if gt
-            else getWorld2View2(camera.R, camera.T)
-        )
+        W2C = camera.T_gt.clone() if gt else camera.T.clone()
         W2C = W2C.cpu().numpy()
         C2W = np.linalg.inv(W2C)
         frustum = create_frustum(C2W, color, size=size)
@@ -288,6 +286,11 @@ class SLAM_GUI:
 
     def _on_close(self):
         self.is_done = True
+        self.process_finished = True
+        if self.q_vis2main is not None:
+            packet = Packet_vis2main()
+            packet.flag_stop = True
+            self.q_vis2main.put(packet)
         return True  # False would cancel the close
 
     def _on_combo_model(self, new_val, new_idx):
@@ -575,7 +578,7 @@ class SLAM_GUI:
         fy = fov2focal(FoVy, image_height)
         cx = image_width // 2
         cy = image_height // 2
-        T = torch.from_numpy(w2c)
+        T = torch.from_numpy(w2c).to("cuda").to(torch.float32)
         current_cam = Camera.init_from_gui(
             uid=-1,
             T=T,
@@ -588,7 +591,7 @@ class SLAM_GUI:
             H=image_height,
             W=image_width,
         )
-        current_cam.update_RT(T[0:3, 0:3], T[0:3, 3])
+        current_cam.T = T.clone()
         return current_cam
 
     def rasterise(self, current_cam):
@@ -675,11 +678,19 @@ class SLAM_GUI:
             self.g_camera.target = frustum.center.astype(np.float32)
             self.g_camera.up = frustum.up.astype(np.float32)
 
-            self.gaussians_gl.xyz = self.gaussian_cur.get_xyz.cpu().numpy()
-            self.gaussians_gl.opacity = self.gaussian_cur.get_opacity.cpu().numpy()
-            self.gaussians_gl.scale = self.gaussian_cur.get_scaling.cpu().numpy()
-            self.gaussians_gl.rot = self.gaussian_cur.get_rotation.cpu().numpy()
-            self.gaussians_gl.sh = self.gaussian_cur.get_features.cpu().numpy()[:, 0, :]
+            self.gaussians_gl.xyz = self.gaussian_cur.get_xyz.detach().cpu().numpy()
+            self.gaussians_gl.opacity = (
+                self.gaussian_cur.get_opacity.detach().cpu().numpy()
+            )
+            self.gaussians_gl.scale = (
+                self.gaussian_cur.get_scaling.detach().cpu().numpy()
+            )
+            self.gaussians_gl.rot = (
+                self.gaussian_cur.get_rotation.detach().cpu().numpy()
+            )
+            self.gaussians_gl.sh = (
+                self.gaussian_cur.get_features.detach().cpu().numpy()[:, 0, :]
+            )
 
             self.update_activated_renderer_state(self.gaussians_gl)
             self.g_renderer.sort_and_update(self.g_camera)
@@ -710,6 +721,11 @@ class SLAM_GUI:
         if not self.init:
             return
         current_cam = self.get_current_cam()
+        ts_now = time.perf_counter()
+        time_lapsed = ts_now - self.ts_prev
+        if time_lapsed < (1.0 / self.render_fps):
+            return
+        self.ts_prev = ts_now
         results = self.rasterise(current_cam)
         if results is None:
             return

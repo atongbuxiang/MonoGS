@@ -1,11 +1,18 @@
 import argparse
 import json
 from pathlib import Path
+import sys
+import math
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
 
 from gaussian_splatting.scene.gaussian_model import GaussianModel
 from gaussian_splatting.utils.graphics_utils import getProjectionMatrix2
 from gaussian_splatting.utils.system_utils import searchForMaxIteration
 from munch import munchify
+from plyfile import PlyData
 import torch
 
 from utils.camera_utils import Camera
@@ -22,9 +29,25 @@ from utils.quality_metrics import (
 
 def load_gaussians_from_ply(config, ply_path):
     model_params = munchify(config["model_params"])
+    model_params.sh_degree = infer_sh_degree_from_ply(ply_path)
     gaussians = GaussianModel(model_params.sh_degree, config=config)
     gaussians.load_ply(str(ply_path))
     return gaussians
+
+
+def infer_sh_degree_from_ply(ply_path):
+    plydata = PlyData.read(str(ply_path))
+    extra_f_names = [
+        p.name for p in plydata.elements[0].properties if p.name.startswith("f_rest_")
+    ]
+    n_extra = len(extra_f_names)
+    coeffs_per_channel = n_extra // 3 + 1
+    sh_degree = int(round(math.sqrt(coeffs_per_channel) - 1))
+    if 3 * ((sh_degree + 1) ** 2 - 1) != n_extra:
+        raise ValueError(
+            f"Cannot infer SH degree from {ply_path}: found {n_extra} f_rest_* properties."
+        )
+    return sh_degree
 
 
 def default_final_ply(result_dir):
@@ -54,7 +77,7 @@ def build_validation_frames(dataset, interval=5):
     frames = {}
     for idx in range(0, len(dataset), interval):
         frame = Camera.init_from_dataset(dataset, idx, projection_matrix)
-        frame.update_RT(frame.R_gt, frame.T_gt)
+        frame.T = frame.T_gt.clone()
         frames[idx] = frame
     return frames
 

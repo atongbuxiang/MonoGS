@@ -4,7 +4,9 @@ import time
 from argparse import ArgumentParser
 from datetime import datetime
 from math import nan
+from pathlib import Path
 
+import numpy as np
 import torch
 import torch.multiprocessing as mp
 import yaml
@@ -18,6 +20,7 @@ from utils.config_utils import load_config
 from utils.dataset import load_dataset
 from utils.eval_utils import eval_ate, eval_rendering, save_gaussians
 from utils.logging_utils import Log
+from utils.live_recording import LiveRGBDRecorder
 from utils.multiprocessing_utils import FakeQueue
 from utils.quality_metrics import (
     compute_voxel_coverage,
@@ -32,8 +35,6 @@ class SLAM:
     def __init__(self, config, save_dir=None):
         start = torch.cuda.Event(enable_timing=True)
         end = torch.cuda.Event(enable_timing=True)
-
-        start.record()
 
         self.config = config
         self.save_dir = save_dir
@@ -50,8 +51,6 @@ class SLAM:
         self.monocular = self.config["Dataset"]["sensor_type"] == "monocular"
         self.use_spherical_harmonics = self.config["Training"]["spherical_harmonics"]
         self.use_gui = self.config["Results"]["use_gui"]
-        if self.live_mode:
-            self.use_gui = True
         self.eval_rendering = self.config["Results"]["eval_rendering"]
         self.eval_real_scan_metrics = bool(
             self.config["Results"].get(
@@ -66,6 +65,28 @@ class SLAM:
         self.dataset = load_dataset(
             model_params, model_params.source_path, config=config
         )
+        if (
+            self.live_mode
+            and self.config["Dataset"]["sensor_type"] == "depth"
+            and save_dir is not None
+        ):
+            record_cfg = self.config.get("Recording", {})
+            enabled = bool(record_cfg.get("enabled", True))
+            if enabled and hasattr(self.dataset, "depth_scale"):
+                self.dataset.recorder = LiveRGBDRecorder(
+                    save_dir=save_dir,
+                    base_config=self.config,
+                    fx=self.dataset.fx,
+                    fy=self.dataset.fy,
+                    cx=self.dataset.cx,
+                    cy=self.dataset.cy,
+                    width=self.dataset.width,
+                    height=self.dataset.height,
+                    frame_stride=record_cfg.get("frame_stride", 1),
+                    depth_scale=record_cfg.get("depth_scale", 1000.0),
+                    dataset_root=record_cfg.get("dataset_root", "datasets"),
+                    dataset_name=record_cfg.get("dataset_name"),
+                )
 
         self.gaussians.training_setup(opt_params)
         bg_color = [0, 0, 0]
@@ -117,6 +138,7 @@ class SLAM:
             gui_process.start()
             time.sleep(5)
 
+        start.record()
         backend_process.start()
         self.frontend.run()
         backend_queue.put(["pause"])
@@ -131,8 +153,13 @@ class SLAM:
 
         self.gaussians = self.frontend.gaussians
         kf_indices = self.frontend.kf_indices
+        if self.save_dir is not None and self.config["Results"]["save_results"]:
+            final_ply = Path(self.save_dir) / "point_cloud" / "final" / "point_cloud.ply"
+            if not final_ply.exists() and self.gaussians is not None:
+                save_gaussians(self.gaussians, self.save_dir, "final", final=True)
+
         final_rendering_result = None
-        if self.eval_rendering:
+        if self.eval_rendering and not self.live_mode:
             ATE = self.try_eval_ate()
 
             rendering_result = eval_rendering(
@@ -196,23 +223,34 @@ class SLAM:
 
         if self.eval_real_scan_metrics and self.save_dir is not None:
             if final_rendering_result is None:
-                final_rendering_result = eval_rendering(
-                    self.frontend.cameras,
-                    self.gaussians,
-                    self.dataset,
-                    self.save_dir,
-                    self.pipeline_params,
-                    self.background,
-                    kf_indices=kf_indices,
-                    iteration="real_scan",
-                    compute_lpips=False,
-                )
+                if self.live_mode:
+                    final_rendering_result = {}
+                else:
+                    final_rendering_result = eval_rendering(
+                        self.frontend.cameras,
+                        self.gaussians,
+                        self.dataset,
+                        self.save_dir,
+                        self.pipeline_params,
+                        self.background,
+                        kf_indices=kf_indices,
+                        iteration="real_scan",
+                        compute_lpips=False,
+                    )
             self.save_real_scan_metrics(
                 rendering_result=final_rendering_result,
                 path_length_m=estimate_path_length_from_cameras(
                     self.frontend.cameras
                 ),
+                fps=FPS,
             )
+        if self.live_mode and hasattr(self.dataset, "recorder") and self.dataset.recorder:
+            offline_cfg_path = self.dataset.recorder.finalize()
+            if offline_cfg_path is not None:
+                Log(
+                    f"Recorded replay dataset and offline eval config at {offline_cfg_path}",
+                    tag="Eval",
+                )
 
         backend_queue.put(["stop"])
         backend_process.join()
@@ -244,18 +282,35 @@ class SLAM:
             Log(f"Skipping ATE: {exc}", tag="Eval")
             return nan
 
-    def save_real_scan_metrics(self, rendering_result, path_length_m):
+    def save_real_scan_metrics(self, rendering_result, path_length_m, fps=None):
         if self.save_dir is None:
             return
         coverage, occupied, total = compute_voxel_coverage(self.gaussians, self.config)
+        quality_summary = {}
+        if self.frontend.quality_logger is not None:
+            quality_summary = self.frontend.quality_logger.summary()
+        psnr_value = rendering_result.get("mean_psnr")
+        ssim_value = rendering_result.get("mean_ssim")
         metrics = {
-            "mean_psnr": rendering_result["mean_psnr"],
-            "mean_ssim": rendering_result["mean_ssim"],
+            "mean_psnr": psnr_value if psnr_value is not None else None,
+            "mean_ssim": ssim_value if ssim_value is not None else None,
             "coverage": float(coverage.item()),
             "coverage_occupied_voxels": int(occupied),
             "coverage_total_voxels": int(total),
             "path_length_m": float(path_length_m),
+            "num_frames": len(self.frontend.cameras),
+            "num_keyframes": len(self.frontend.kf_indices),
         }
+        if self.live_mode and (psnr_value is None or ssim_value is None):
+            metrics["render_metrics_computed"] = False
+            metrics["render_metrics_note"] = (
+                "PSNR/SSIM are not computed in live Realsense mode during SLAM runtime."
+            )
+        else:
+            metrics["render_metrics_computed"] = True
+        if fps is not None and np.isfinite(fps):
+            metrics["fps"] = float(fps)
+        metrics.update(quality_summary)
         output_path = os.path.join(self.save_dir, "real_scan_metrics.json")
         save_offline_metrics(metrics, output_path)
         Log(f"Saved real scan metrics to {output_path}", tag="Eval")

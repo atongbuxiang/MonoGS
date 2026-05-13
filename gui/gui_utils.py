@@ -1,6 +1,7 @@
 import queue
 
 import cv2
+import copy
 import numpy as np
 import open3d as o3d
 import torch
@@ -109,7 +110,7 @@ class GaussianPacket:
         self.gtcolor = self.resize_img(gtcolor, 320)
         self.gtdepth = self.resize_img(gtdepth, 320)
         self.gtnormal = self.resize_img(gtnormal, 320)
-        self.keyframes = keyframes
+        self.keyframes = copy.deepcopy(keyframes)
         self.finish = finish
         self.kf_window = kf_window
         self.quality_metrics = quality_metrics
@@ -159,6 +160,7 @@ def get_latest_queue(q):
 
 class Packet_vis2main:
     flag_pause = None
+    flag_stop = False
 
 
 class ParamsGUI:
