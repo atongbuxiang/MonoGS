@@ -4,6 +4,9 @@ from pathlib import Path
 
 import cv2
 import evo
+import matplotlib
+import matplotlib.cm as cm
+import matplotlib.colors as mcolors
 import numpy as np
 import torch
 from evo.core import metrics, trajectory
@@ -12,6 +15,8 @@ from evo.core.trajectory import PosePath3D, PoseTrajectory3D
 from evo.tools import plot
 from evo.tools.plot import PlotMode
 from evo.tools.settings import SETTINGS
+
+matplotlib.use("Agg")
 from matplotlib import pyplot as plt
 from torchmetrics.image.lpip import LearnedPerceptualImagePatchSimilarity
 
@@ -42,7 +47,7 @@ def evaluate_evo(poses_gt, poses_est, plot_dir, label, monocular=False):
     ape_metric.process_data(data)
     ape_stat = ape_metric.get_statistic(metrics.StatisticsType.rmse)
     ape_stats = ape_metric.get_all_statistics()
-    Log("RMSE ATE \[m]", ape_stat, tag="Eval")
+    Log(r"RMSE ATE [m]", ape_stat, tag="Eval")
 
     with open(
         os.path.join(plot_dir, "stats_{}.json".format(str(label))),
@@ -56,16 +61,32 @@ def evaluate_evo(poses_gt, poses_est, plot_dir, label, monocular=False):
     ax = evo.tools.plot.prepare_axis(fig, plot_mode)
     ax.set_title(f"ATE RMSE: {ape_stat}")
     evo.tools.plot.traj(ax, plot_mode, traj_ref, "--", "gray", "gt")
-    evo.tools.plot.traj_colormap(
-        ax,
-        traj_est_aligned,
-        ape_metric.error,
-        plot_mode,
-        min_map=ape_stats["min"],
-        max_map=ape_stats["max"],
+    traj_xy = traj_est_aligned.positions_xyz[:, :2]
+    ax.plot(traj_xy[:, 0], traj_xy[:, 1], color="tab:blue", linewidth=1.0, alpha=0.6)
+    norm = mcolors.Normalize(
+        vmin=ape_stats["min"], vmax=ape_stats["max"], clip=True
+    )
+    scatter = ax.scatter(
+        traj_xy[:, 0],
+        traj_xy[:, 1],
+        c=ape_metric.error,
+        cmap=cm.get_cmap(SETTINGS.plot_trajectory_cmap),
+        norm=norm,
+        s=8,
+        label="est",
+    )
+    fig.colorbar(
+        scatter,
+        ax=ax,
+        ticks=[
+            ape_stats["min"],
+            ape_stats["max"] - (ape_stats["max"] - ape_stats["min"]) / 2,
+            ape_stats["max"],
+        ],
     )
     ax.legend()
     plt.savefig(os.path.join(plot_dir, "evo_2dplot_{}.png".format(str(label))), dpi=90)
+    plt.close(fig)
 
     return ape_stat
 
@@ -76,16 +97,10 @@ def eval_ate(frames, kf_ids, save_dir, iterations, final=False, monocular=False)
     trj_id, trj_est, trj_gt = [], [], []
     trj_est_np, trj_gt_np = [], []
 
-    def gen_pose_matrix(R, T):
-        pose = np.eye(4)
-        pose[0:3, 0:3] = R.cpu().numpy()
-        pose[0:3, 3] = T.cpu().numpy()
-        return pose
-
     for kf_id in kf_ids:
         kf = frames[kf_id]
-        pose_est = np.linalg.inv(gen_pose_matrix(kf.R, kf.T))
-        pose_gt = np.linalg.inv(gen_pose_matrix(kf.R_gt, kf.T_gt))
+        pose_est = np.linalg.inv(kf.T.cpu().numpy())
+        pose_gt = np.linalg.inv(kf.T_gt.cpu().numpy())
 
         trj_id.append(frames[kf_id].uid)
         trj_est.append(pose_est.tolist())
@@ -131,16 +146,31 @@ def eval_rendering(
 ):
     interval = 5
     img_pred, img_gt, saved_frame_idx = [], [], []
-    end_idx = len(frames) - 1 if iteration == "final" or "before_opt" else iteration
+    if isinstance(iteration, str):
+        end_idx = len(frames)
+    else:
+        end_idx = min(len(frames), int(iteration))
     psnr_array, ssim_array, lpips_array = [], [], []
     cal_lpips = None
     if compute_lpips:
         cal_lpips = LearnedPerceptualImagePatchSimilarity(
             net_type="alex", normalize=True
         ).to("cuda")
-    for idx in range(0, end_idx, interval):
-        if idx in kf_indices:
-            continue
+
+    kf_index_set = set(kf_indices or [])
+    candidate_indices = [
+        idx for idx in range(0, end_idx, interval) if idx not in kf_index_set
+    ]
+    if not candidate_indices:
+        candidate_indices = [idx for idx in range(0, end_idx) if idx not in kf_index_set]
+    if not candidate_indices:
+        candidate_indices = list(range(0, end_idx))
+        Log(
+            "No non-keyframe evaluation views found; falling back to evaluating keyframes.",
+            tag="Eval",
+        )
+
+    for idx in candidate_indices:
         saved_frame_idx.append(idx)
         frame = frames[idx]
         gt_image, _, _ = dataset[idx]
@@ -169,9 +199,10 @@ def eval_rendering(
         ssim_array.append(ssim_score.item())
 
     output = dict()
-    output["mean_psnr"] = float(np.mean(psnr_array))
-    output["mean_ssim"] = float(np.mean(ssim_array))
+    output["mean_psnr"] = float(np.mean(psnr_array)) if psnr_array else float("nan")
+    output["mean_ssim"] = float(np.mean(ssim_array)) if ssim_array else float("nan")
     output["mean_lpips"] = float(np.mean(lpips_array)) if lpips_array else float("nan")
+    output["num_eval_frames"] = len(candidate_indices)
 
     Log(
         f'mean psnr: {output["mean_psnr"]}, ssim: {output["mean_ssim"]}, lpips: {output["mean_lpips"]}',

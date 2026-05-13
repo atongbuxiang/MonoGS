@@ -357,7 +357,7 @@ class BackEnd(mp.Process):
         keyframes = []
         for kf_idx in self.current_window:
             kf = self.viewpoints[kf_idx]
-            keyframes.append((kf_idx, kf.R.clone(), kf.T.clone()))
+            keyframes.append((kf_idx, kf.T.clone()))
         if tag is None:
             tag = "sync_backend"
 
@@ -477,6 +477,5 @@ class BackEnd(mp.Process):
                     raise Exception("Unprocessed data", data)
         while not self.backend_queue.empty():
             self.backend_queue.get()
-        while not self.frontend_queue.empty():
-            self.frontend_queue.get()
+        self.frontend_queue = None
         return

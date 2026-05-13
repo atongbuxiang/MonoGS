@@ -5,9 +5,9 @@ import torch
 import torch.multiprocessing as mp
 
 from gaussian_splatting.gaussian_renderer import render
-from gaussian_splatting.utils.graphics_utils import getProjectionMatrix2, getWorld2View2
+from gaussian_splatting.utils.graphics_utils import getProjectionMatrix2
 from gui import gui_utils
-from utils.camera_utils import Camera
+from utils.camera_utils import Camera, CameraMsg
 from utils.eval_utils import eval_ate, save_gaussians
 from utils.logging_utils import Log
 from utils.multiprocessing_utils import clone_obj
@@ -56,15 +56,22 @@ class FrontEnd(mp.Process):
         self.tracking_itr_num = self.config["Training"]["tracking_itr_num"]
         self.kf_interval = self.config["Training"]["kf_interval"]
         self.window_size = self.config["Training"]["window_size"]
-        self.single_thread = self.config["Training"]["single_thread"]
+        self.single_thread = (
+            self.config["Dataset"]["single_thread"]
+            if "single_thread" in self.config["Dataset"]
+            else self.config["Training"]["single_thread"]
+        )
+        self.use_gui = self.config["Results"]["use_gui"]
+        self.constant_velocity_warmup = 200
         qcfg = self.config.get("Quality", {})
         quality_enabled = bool(qcfg.get("enabled", False))
         quality_output_path = qcfg.get("output_path")
         if quality_enabled and quality_output_path is None and self.save_dir is not None:
-            quality_output_path = f"{self.save_dir}/quality_metrics.parquet"
+            quality_output_path = f"{self.save_dir}/quality_metrics.csv"
         self.quality_logger = QualityMetricLogger(
             enabled=quality_enabled,
             output_path=quality_output_path,
+            flush_every_frame=qcfg.get("flush_every_frame", True),
         )
 
     def record_quality_metrics(self, cur_frame_idx, viewpoint, render_pkg):
@@ -170,7 +177,7 @@ class FrontEnd(mp.Process):
             self.backend_queue.get()
 
         # Initialise the frame at the ground truth pose
-        viewpoint.update_RT(viewpoint.R_gt, viewpoint.T_gt)
+        viewpoint.T = viewpoint.T_gt.clone()
 
         self.kf_indices = []
         depth_map = self.add_new_keyframe(cur_frame_idx, init=True)
@@ -178,8 +185,20 @@ class FrontEnd(mp.Process):
         self.reset = False
 
     def tracking(self, cur_frame_idx, viewpoint):
-        prev = self.cameras[cur_frame_idx - self.use_every_n_frames]
-        viewpoint.update_RT(prev.R, prev.T)
+        if (
+            self.initialized
+            and cur_frame_idx > self.constant_velocity_warmup
+            and self.monocular
+        ):
+            prev_prev = self.cameras[cur_frame_idx - self.use_every_n_frames - 1]
+            prev = self.cameras[cur_frame_idx - self.use_every_n_frames]
+            pose_prev_prev = prev_prev.T
+            pose_prev = prev.T
+            velocity = pose_prev @ torch.linalg.inv(pose_prev_prev)
+            viewpoint.T = velocity @ pose_prev
+        else:
+            prev = self.cameras[cur_frame_idx - self.use_every_n_frames]
+            viewpoint.T = prev.T.clone()
 
         opt_params = []
         opt_params.append(
@@ -231,10 +250,10 @@ class FrontEnd(mp.Process):
                 pose_optimizer.step()
                 converged = update_pose(viewpoint)
 
-            if tracking_itr % 10 == 0:
+            if tracking_itr % 50 == 0:
                 self.q_main2vis.put(
                     gui_utils.GaussianPacket(
-                        current_frame=viewpoint,
+                        current_frame=CameraMsg(viewpoint),
                         gtcolor=viewpoint.original_image,
                         gtdepth=viewpoint.depth
                         if not self.monocular
@@ -260,8 +279,8 @@ class FrontEnd(mp.Process):
 
         curr_frame = self.cameras[cur_frame_idx]
         last_kf = self.cameras[last_keyframe_idx]
-        pose_CW = getWorld2View2(curr_frame.R, curr_frame.T)
-        last_kf_CW = getWorld2View2(last_kf.R, last_kf.T)
+        pose_CW = curr_frame.T
+        last_kf_CW = last_kf.T
         last_kf_WC = torch.linalg.inv(last_kf_CW)
         dist = torch.norm((pose_CW @ last_kf_WC)[0:3, 3])
         dist_check = dist > kf_translation * self.median_depth
@@ -309,7 +328,7 @@ class FrontEnd(mp.Process):
         if to_remove:
             window.remove(to_remove[-1])
             removed_frame = to_remove[-1]
-        kf_0_WC = torch.linalg.inv(getWorld2View2(curr_frame.R, curr_frame.T))
+        kf_0_WC = torch.linalg.inv(curr_frame.T)
 
         if len(window) > self.config["Training"]["window_size"]:
             # we need to find the keyframe to remove...
@@ -318,13 +337,13 @@ class FrontEnd(mp.Process):
                 inv_dists = []
                 kf_i_idx = window[i]
                 kf_i = self.cameras[kf_i_idx]
-                kf_i_CW = getWorld2View2(kf_i.R, kf_i.T)
+                kf_i_CW = kf_i.T
                 for j in range(N_dont_touch, len(window)):
                     if i == j:
                         continue
                     kf_j_idx = window[j]
                     kf_j = self.cameras[kf_j_idx]
-                    kf_j_WC = torch.linalg.inv(getWorld2View2(kf_j.R, kf_j.T))
+                    kf_j_WC = torch.linalg.inv(kf_j.T)
                     T_CiCj = kf_i_CW @ kf_j_WC
                     inv_dists.append(1.0 / (torch.norm(T_CiCj[0:3, 3]) + 1e-6).item())
                 T_CiC0 = kf_i_CW @ kf_0_WC
@@ -357,8 +376,10 @@ class FrontEnd(mp.Process):
         keyframes = data[3]
         self.occ_aware_visibility = occ_aware_visibility
 
-        for kf_id, kf_R, kf_T in keyframes:
-            self.cameras[kf_id].update_RT(kf_R.clone(), kf_T.clone())
+        for kf_id, kf_T in keyframes:
+            self.cameras[kf_id].T = kf_T.clone()
+            if hasattr(self.dataset, "recorder") and self.dataset.recorder is not None:
+                self.dataset.recorder.record_pose(kf_id, self.cameras[kf_id].T)
 
     def cleanup(self, cur_frame_idx):
         self.cameras[cur_frame_idx].clean()
@@ -378,15 +399,16 @@ class FrontEnd(mp.Process):
             H=self.dataset.height,
         ).transpose(0, 1)
         projection_matrix = projection_matrix.to(device=self.device)
-        tic = torch.cuda.Event(enable_timing=True)
-        toc = torch.cuda.Event(enable_timing=True)
-
         while True:
             if self.q_vis2main.empty():
                 if self.pause:
                     continue
             else:
                 data_vis2main = self.q_vis2main.get()
+                if getattr(data_vis2main, "flag_stop", False):
+                    Log("Frontend received GUI stop signal.")
+                    self.backend_queue.put(["pause"])
+                    break
                 self.pause = data_vis2main.flag_pause
                 if self.pause:
                     self.backend_queue.put(["pause"])
@@ -395,7 +417,6 @@ class FrontEnd(mp.Process):
                     self.backend_queue.put(["unpause"])
 
             if self.frontend_queue.empty():
-                tic.record()
                 if cur_frame_idx >= len(self.dataset):
                     if self.save_results:
                         if self.save_trj and len(self.kf_indices) >= 3:
@@ -421,7 +442,7 @@ class FrontEnd(mp.Process):
                     continue
 
                 if not self.initialized and self.requested_keyframe > 0:
-                    time.sleep(0.01)
+                    time.sleep(0.001)
                     continue
 
                 viewpoint = Camera.init_from_dataset(
@@ -449,17 +470,28 @@ class FrontEnd(mp.Process):
 
                 current_window_dict = {}
                 current_window_dict[self.current_window[0]] = self.current_window[1:]
-                keyframes = [self.cameras[kf_idx] for kf_idx in self.current_window]
-
-                self.q_main2vis.put(
-                    gui_utils.GaussianPacket(
-                        gaussians=clone_obj(self.gaussians),
-                        current_frame=viewpoint,
-                        keyframes=keyframes,
-                        kf_window=current_window_dict,
-                        quality_metrics=quality_metrics,
+                keyframes = [
+                    CameraMsg(self.cameras[kf_idx]) for kf_idx in self.current_window
+                ]
+                if cur_frame_idx % 5 == 0:
+                    self.q_main2vis.put(
+                        gui_utils.GaussianPacket(
+                            gaussians=clone_obj(self.gaussians),
+                            current_frame=CameraMsg(viewpoint),
+                            keyframes=keyframes,
+                            kf_window=current_window_dict,
+                            quality_metrics=quality_metrics,
+                        )
                     )
-                )
+                else:
+                    self.q_main2vis.put(
+                        gui_utils.GaussianPacket(
+                            current_frame=CameraMsg(viewpoint),
+                            keyframes=keyframes,
+                            kf_window=current_window_dict,
+                            quality_metrics=quality_metrics,
+                        )
+                    )
 
                 if self.requested_keyframe > 0:
                     self.cleanup(cur_frame_idx)
@@ -519,6 +551,7 @@ class FrontEnd(mp.Process):
                     self.save_results
                     and self.save_trj
                     and create_kf
+                    and self.save_trj_kf_intv > 0
                     and len(self.kf_indices) % self.save_trj_kf_intv == 0
                 ):
                     Log("Evaluating ATE at frame: ", cur_frame_idx)
@@ -529,12 +562,6 @@ class FrontEnd(mp.Process):
                         cur_frame_idx,
                         monocular=self.monocular,
                     )
-                toc.record()
-                torch.cuda.synchronize()
-                if create_kf:
-                    # throttle at 3fps when keyframe is added
-                    duration = tic.elapsed_time(toc)
-                    time.sleep(max(0.01, 1.0 / 3.0 - duration / 1000))
             else:
                 data = self.frontend_queue.get()
                 if data[0] == "sync_backend":
@@ -551,7 +578,7 @@ class FrontEnd(mp.Process):
                         self.q_main2vis.put(
                             gui_utils.GaussianPacket(
                                 gaussians=clone_obj(self.gaussians),
-                                current_frame=self.cameras[0],
+                                current_frame=CameraMsg(self.cameras[0]),
                                 quality_metrics=quality_metrics,
                             )
                         )

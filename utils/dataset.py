@@ -7,7 +7,10 @@ import cv2
 import numpy as np
 import torch
 import trimesh
-from PIL import Image
+try:
+    import lycon
+except Exception:
+    lycon = None
 
 from gaussian_splatting.utils.graphics_utils import focal2fov
 
@@ -15,6 +18,17 @@ try:
     import pyrealsense2 as rs
 except Exception:
     pass
+
+
+def load_color_image(path):
+    if lycon is not None:
+        image = lycon.load(path)
+        if image is not None:
+            return image
+    image = cv2.imread(path, cv2.IMREAD_COLOR)
+    if image is None:
+        raise FileNotFoundError(f"Failed to load image: {path}")
+    return cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
 
 
 class ReplicaParser:
@@ -53,7 +67,7 @@ class TUMParser:
         self.n_img = len(self.color_paths)
 
     def parse_list(self, filepath, skiprows=0):
-        data = np.loadtxt(filepath, delimiter=" ", dtype=np.unicode_, skiprows=skiprows)
+        data = np.loadtxt(filepath, delimiter=" ", dtype=str, skiprows=skiprows)
         return data
 
     def associate_frames(self, tstamp_image, tstamp_depth, tstamp_pose, max_dt=0.08):
@@ -173,9 +187,6 @@ class EuRoCParser:
         for i in range(self.n_img):
             trans = data[pose_indices[i], 1:4]
             quat = data[pose_indices[i], 4:8]
-            quat = quat[[1, 2, 3, 0]]
-            
-            
             T_w_i = trimesh.transformations.quaternion_matrix(np.roll(quat, 1))
             T_w_i[:3, 3] = trans
             T_w_c = np.dot(T_w_i, T_i_c0)
@@ -199,6 +210,8 @@ class BaseDataset(torch.utils.data.Dataset):
         self.device = "cuda:0"
         self.dtype = torch.float32
         self.num_imgs = 999999
+        if "max_frames" in config.get("Dataset", {}):
+            self.num_imgs = int(config["Dataset"]["max_frames"])
 
     def __len__(self):
         return self.num_imgs
@@ -259,7 +272,7 @@ class MonocularDataset(BaseDataset):
         color_path = self.color_paths[idx]
         pose = self.poses[idx]
 
-        image = np.array(Image.open(color_path))
+        image = load_color_image(color_path)
         depth = None
 
         if self.disorted:
@@ -267,7 +280,7 @@ class MonocularDataset(BaseDataset):
 
         if self.has_depth:
             depth_path = self.depth_paths[idx]
-            depth = np.array(Image.open(depth_path)) / self.depth_scale
+            depth = cv2.imread(depth_path, cv2.IMREAD_ANYDEPTH) / self.depth_scale
 
         image = (
             torch.from_numpy(image / 255.0)
@@ -420,7 +433,7 @@ class EurocDataset(StereoDataset):
     def __init__(self, args, path, config):
         super().__init__(args, path, config)
         dataset_path = config["Dataset"]["dataset_path"]
-        parser = EuRoCParser(dataset_path, start_idx=config["Dataset"]["start_idx"])
+        parser = EuRoCParser(dataset_path, start_idx=0)
         self.num_imgs = parser.n_img
         self.color_paths = parser.color_paths
         self.color_paths_r = parser.color_paths_r
@@ -431,16 +444,15 @@ class RealsenseDataset(BaseDataset):
     def __init__(self, args, path, config):
         super().__init__(args, path, config)
         self.pipeline = rs.pipeline()
-        self.h, self.w = 720, 1280
-        
+        self.h, self.w = 360, 640
         self.depth_scale = 0
-        if self.config["Dataset"]["sensor_type"] == "depth":
-            self.has_depth = True 
-        else: 
-            self.has_depth = False
+        self.has_depth = self.config["Dataset"]["sensor_type"] == "depth"
+        self.num_frames = 0
 
         self.rs_config = rs.config()
-        self.rs_config.enable_stream(rs.stream.color, self.w, self.h, rs.format.bgr8, 30)
+        self.rs_config.enable_stream(
+            rs.stream.color, self.w, self.h, rs.format.bgr8, 30
+        )
         if self.has_depth:
             self.rs_config.enable_stream(rs.stream.depth)
 
@@ -452,14 +464,13 @@ class RealsenseDataset(BaseDataset):
 
         self.rgb_sensor = self.profile.get_device().query_sensors()[1]
         self.rgb_sensor.set_option(rs.option.enable_auto_exposure, False)
-        # rgb_sensor.set_option(rs.option.enable_auto_white_balance, True)
         self.rgb_sensor.set_option(rs.option.enable_auto_white_balance, False)
-        self.rgb_sensor.set_option(rs.option.exposure, 200)
+        self.rgb_sensor.set_option(rs.option.exposure, 100)
         self.rgb_profile = rs.video_stream_profile(
             self.profile.get_stream(rs.stream.color)
         )
         self.rgb_intrinsics = self.rgb_profile.get_intrinsics()
-        
+
         self.fx = self.rgb_intrinsics.fx
         self.fy = self.rgb_intrinsics.fy
         self.cx = self.rgb_intrinsics.ppx
@@ -480,35 +491,28 @@ class RealsenseDataset(BaseDataset):
 
         if self.has_depth:
             self.depth_sensor = self.profile.get_device().first_depth_sensor()
-            self.depth_scale  = self.depth_sensor.get_depth_scale()
+            self.depth_scale = self.depth_sensor.get_depth_scale()
             self.depth_profile = rs.video_stream_profile(
                 self.profile.get_stream(rs.stream.depth)
             )
             self.depth_intrinsics = self.depth_profile.get_intrinsics()
-        
-        
-
+            print("Depth Scale is: ", self.depth_scale)
+            print("Depth intrinsics: ", self.depth_intrinsics)
+            print("RGB intrinsics: ", self.rgb_intrinsics)
+        self.recorder = None
 
     def __getitem__(self, idx):
         pose = torch.eye(4, device=self.device, dtype=self.dtype)
-        depth = None
-
         frameset = self.pipeline.wait_for_frames()
+        aligned_frames = self.align.process(frameset) if self.has_depth else frameset
+        self.num_frames += 1
 
-        if self.has_depth:
-            aligned_frames = self.align.process(frameset)
-            rgb_frame = aligned_frames.get_color_frame()
-            aligned_depth_frame = aligned_frames.get_depth_frame()
-            depth = np.array(aligned_depth_frame.get_data())*self.depth_scale
-            depth[depth < 0] = 0
-            np.nan_to_num(depth, nan=1000)
-        else:
-            rgb_frame = frameset.get_color_frame()
-
+        rgb_frame = aligned_frames.get_color_frame()
         image = np.asanyarray(rgb_frame.get_data())
         image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
         if self.disorted:
             image = cv2.remap(image, self.map1x, self.map1y, cv2.INTER_LINEAR)
+        image_np = image
 
         image = (
             torch.from_numpy(image / 255.0)
@@ -516,6 +520,15 @@ class RealsenseDataset(BaseDataset):
             .permute(2, 0, 1)
             .to(device=self.device, dtype=self.dtype)
         )
+        depth = None
+        if self.has_depth:
+            aligned_depth_frame = aligned_frames.get_depth_frame()
+            depth = np.array(aligned_depth_frame.get_data()) * self.depth_scale
+            depth[depth < 0] = 0
+            depth = np.nan_to_num(depth, nan=1000)
+
+        if self.recorder is not None:
+            self.recorder.record_frame(self.num_frames - 1, image_np, depth)
 
         return image, depth, pose
 
