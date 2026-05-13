@@ -1,0 +1,72 @@
+inherit_from: "configs/mono/tum/base_config.yaml"
+
+Results:
+  save_results: True
+  save_dir: "results/box_rgb"
+  save_trj: True
+  save_trj_kf_intv: 5
+  use_gui: True
+  eval_rendering: True
+  eval_real_scan_metrics: True
+  use_wandb: False
+
+Dataset:
+  dataset_path: "datasets/box"
+  type: "tum"
+  sensor_type: "monocular"
+  pcd_downsample: 24
+  pcd_downsample_init: 12
+  adaptive_pointsize: True
+  point_size: 0.001
+  Calibration:
+    fx: 387.0813598633
+    fy: 386.5223388672
+    cx: 329.3368225098
+    cy: 242.7561645508
+    k1: -0.0561877228
+    k2: 0.0679568723
+    p1: 0.0003440059
+    p2: 0.0010787765
+    k3: -0.0222553127
+    distorted: False
+    width: 640
+    height: 480
+    depth_scale: 1000.0
+
+Training:
+  init_itr_num: 1500
+  tracking_itr_num: 120
+  mapping_itr_num: 220
+  gaussian_update_every: 100
+  gaussian_th: 0.6
+  gaussian_extent: 0.35
+  size_threshold: 10
+  kf_interval: 3
+  window_size: 12
+  pose_window: 5
+  kf_translation: 0.025
+  kf_min_translation: 0.008
+  kf_overlap: 0.92
+  single_thread: False
+  spherical_harmonics: True
+
+Quality:
+  enabled: True
+  output_path: null
+  flush_every_frame: True
+  bbox_min: [-0.15, -0.15, 0.2]
+  bbox_max: [0.45, 0.25, 0.75]
+  coverage_grid_size: 32
+  gaussian_opacity_th: 0.2
+  opacity_th: 0.2
+  scale_ref: 0.015
+  aniso_ref: 4.0
+  obs_ref: 5.0
+  unc_w_scale: 0.4
+  unc_w_aniso: 0.3
+  unc_w_obs: 0.3
+  q_min: [0.0, 0.0, 0.0]
+  q_max: [1.0, 1.0, 0.3]
+
+EvalMetrics:
+  validation_interval: 1

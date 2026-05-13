@@ -1,0 +1,22 @@
+inherit_from: "configs/rgbd/cubes/base_config.yaml"
+
+Results:
+  save_dir: "results/cubes_rgbd"
+
+Dataset:
+  dataset_path: "datasets/cubes03"
+  sensor_type: "depth"
+  Calibration:
+    fx: 387.0813598633
+    fy: 386.5223388672
+    cx: 329.3368225098
+    cy: 242.7561645508
+    k1: -0.0561877228
+    k2: 0.0679568723
+    p1: 0.0003440059
+    p2: 0.0010787765
+    k3: -0.0222553127
+    distorted: False
+    width: 640
+    height: 480
+    depth_scale: 1000.0

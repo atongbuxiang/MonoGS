@@ -1,14 +1,18 @@
 Results:
-  save_results: False
+  save_results: True
   save_dir: "results"
   save_trj: False
   save_trj_kf_intv: 0
   use_gui: True
   eval_rendering: False
+  eval_real_scan_metrics: True
   use_wandb: False
 
 Dataset:
+  dataset_path: "live/realsense_d455_rgb"
   sensor_type: 'monocular'
+  # Omit this for unlimited live capture, or set a fixed number for an automatic stop.
+  # max_frames: 600
   pcd_downsample: 32
   pcd_downsample_init: 32
   adaptive_pointsize: True
@@ -77,3 +81,22 @@ model_params:
 pipeline_params:
   convert_SHs_python: False
   compute_cov3D_python: False
+
+Quality:
+  enabled: True
+  # With .csv, each frame is flushed immediately for real-time consumption.
+  output_path: null
+  flush_every_frame: True
+  bbox_min: [-2.0, -2.0, -2.0]
+  bbox_max: [2.0, 2.0, 2.0]
+  coverage_grid_size: 32
+  gaussian_opacity_th: 0.2
+  opacity_th: 0.2
+  scale_ref: 0.03
+  aniso_ref: 4.0
+  obs_ref: 5.0
+  unc_w_scale: 0.4
+  unc_w_aniso: 0.3
+  unc_w_obs: 0.3
+  q_min: [0.0, 0.0, 0.0]
+  q_max: [1.0, 1.0, 0.3]
